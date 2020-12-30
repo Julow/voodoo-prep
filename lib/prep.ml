@@ -19,7 +19,7 @@ type package_info = {
 type source_info = {
   root : Fpath.t;  (** Root path in which this was found *)
   relpath : Fpath.t;  (** Path relative to [root] *)
-  name : string;  (** 'Astring' *)
+  name : string;  (** 'Astring', 'page-index' *)
   package : package_info; (* Package in which this file lives ("astring") *)
 }
 
@@ -29,6 +29,12 @@ let top_path = Fpath.v "prep"
 let get_cm_info root package relpath =
   let _, lname = Fpath.split_base relpath in
   let name = String.capitalize (Fpath.to_string lname) in
+  try [ { root; relpath; name; package } ] with _ -> []
+
+(** Get info given a doc file (mld) *)
+let get_doc_info root package relpath =
+  let _, lname = Fpath.split_base relpath in
+  let name = "page-" ^ Fpath.to_string lname in
   try [ { root; relpath; name; package } ] with _ -> []
 
 (** Lower is better *)
@@ -62,17 +68,20 @@ let get_cm_files files =
     Keep only one of the corresponding .cmti, .cmt or .cmi for a module, in
     that order of preference. *)
 let infos_of_package package_opam =
-  let partition_by_kind lib f =
+  let partition_by_kind (doc, lib) f =
     let segs = Fpath.segs f in
     match segs with
     | "lib" :: _
       when not (List.mem ".private" segs || List.mem ".coq-native" segs) ->
-        f :: lib
-    | _ -> lib
+        (doc, f :: lib)
+    | "doc" :: _ when Inputs.has_ext [ ".mld" ] f ->
+        (* TODO: keep other doc files (may be .md, .ml or others). *)
+        (f :: doc, lib)
+    | _ -> (doc, lib)
   in
   let package_name = package_opam.Opam.name in
-  let lib =
-    List.fold_left partition_by_kind [] (Opam.pkg_contents package_name)
+  let doc, lib =
+    List.fold_left partition_by_kind ([], []) (Opam.pkg_contents package_name)
   in
   let lib = get_cm_files lib in
   let prefix = Opam.prefix () |> Fpath.v in
@@ -82,7 +91,9 @@ let infos_of_package package_opam =
       Universe.pp universe;
     { package_opam; universe }
   in
-  List.flatten (List.map (get_cm_info prefix package) lib)
+  List.flatten
+    ( List.map (get_cm_info prefix package) lib
+    @ List.map (get_doc_info prefix package) doc )
 
 let run whitelist _roots =
   let packages = Opam.all_opam_packages () in
