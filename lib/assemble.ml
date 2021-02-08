@@ -78,17 +78,41 @@ let module_name_of_path f =
     Some (module_name_of_string (Fpath.basename (Fpath.rem_ext f)))
   else None
 
-(** Search recursively for modules. *)
-let rec modules_of_subpkg p =
+type subpkg = { s_relpath : Fpath.t; s_modules : string list }
+
+type version = { v_name : string; v_subpkgs : subpkg list }
+
+type package = { p_name : string; p_versions : version list }
+
+type universe = { u_name : string; u_packages : package list }
+
+(** Search recursively for sub-packages, a directory = a sub package.
+    TODO: this is not working in most cases. *)
+let rec read_subpkgs prefix p =
   let get_module (_, p) =
     match module_name_of_path p with
     | Some m as m' when not (is_hidden m) -> m'
     | _ -> None
   in
   let dirs, files = List.partition is_dir (Util.list_dir p) in
-  (* Remove duplicates due to several cm{ti,t,i} per modules. *)
-  List.sort_uniq String.compare (List.filter_map get_module files)
-  @ List.concat_map (fun (_, p') -> modules_of_subpkg p') dirs
+  let s_modules =
+    List.sort_uniq String.compare (List.filter_map get_module files)
+  in
+  { s_relpath = prefix; s_modules }
+  :: List.concat_map (fun (s, p') -> read_subpkgs (prefix / s) p') dirs
+
+let read_versions p =
+  Util.list_dir p |> List.filter is_dir
+  |> List.map (fun (v_name, p') ->
+         { v_name; v_subpkgs = read_subpkgs (Fpath.v "lib") (p' / "lib") })
+
+let read_packages p =
+  Util.list_dir p |> List.filter is_dir
+  |> List.map (fun (p_name, p') -> { p_name; p_versions = read_versions p' })
+
+let read_universes p =
+  Util.list_dir p |> List.filter is_dir
+  |> List.map (fun (u_name, p') -> { u_name; u_packages = read_packages p' })
 
 let pp_childpages out =
   List.iter (fun p -> fpf out "- {!childpage:%s}\n" (page_name_of_string p))
@@ -100,62 +124,52 @@ let gen_universes_list universes out =
     "{0 Universes}\n\
      These universes are for those packages that are compiled against an \
      alternative set of dependencies than those in the 'packages' hierarchy.\n";
-  pp_childpages out universes;
+  pp_childpages out (List.map (fun u -> u.u_name) universes);
   ()
 
-let gen_universe_page universe_name packages out =
+let gen_universe_page universe out =
   fpf out
     "{0 Universe %s}\n\
      {1 Packages}\n\
      This dependency universe has been used to compile the following packages:\n"
-    universe_name;
-  pp_childpages out packages;
+    universe.u_name;
+  pp_childpages out (List.map (fun p -> p.p_name) universe.u_packages);
   ()
 
-let gen_versions_list pkg_name versions out =
-  fpf out "{0 Package '%s'}\n{1 Versions}\n" pkg_name;
-  pp_childpages out versions;
+let gen_versions_list pkg out =
+  fpf out "{0 Package '%s'}\n{1 Versions}\n" pkg.p_name;
+  pp_childpages out (List.map (fun v -> v.v_name) pkg.p_versions);
   ()
 
-let gen_package_page pkg_name version subpkgs out =
-  let gen_subpkg (name, modules) =
+let gen_package_page pkg_name ver out =
+  let gen_subpkg subpkg =
+    let segs = match Fpath.segs subpkg.s_relpath with _ :: tl | tl -> tl in
+    let name = String.concat "." (pkg_name :: segs) in
     fpf out "{1 [%s]}\n" name;
-    pp_childmodules out modules;
+    pp_childmodules out subpkg.s_modules;
     ()
   in
-  fpf out "{0 Package '%s' version %s}\n" pkg_name version;
-  List.iter gen_subpkg subpkgs;
+  fpf out "{0 Package '%s' version %s}\n" pkg_name ver.v_name;
+  List.iter gen_subpkg ver.v_subpkgs;
   ()
 
-let assemble_package pkg_name version p =
-  let subpkgs =
-    (* This is not working in most cases.
-       TODO: Better listing of sub packages. *)
-    Util.list_dir (Fpath.( / ) p "lib")
-    |> List.filter is_dir
-    |> List.map (fun (s, p') -> (s, modules_of_subpkg p'))
-  in
-  (* TODO: Detect user's package pages (not yet copied by 'prep') *)
-  write_file (index_page_of_dir p) (gen_package_page pkg_name version subpkgs)
+let assemble_package p pkg_name ver =
+  let p = p / ver.v_name in
+  write_file (index_page_of_dir p) (gen_package_page pkg_name ver)
 
-let assemble_package_versions pkg_name p =
-  let versions = List.filter is_dir (Util.list_dir p) in
-  write_file (index_page_of_dir p)
-    (gen_versions_list pkg_name (List.map fst versions));
-  List.iter (fun (v, p') -> assemble_package pkg_name v p') versions
+let assemble_package_versions p pkg =
+  let p = p / pkg.p_name in
+  write_file (index_page_of_dir p) (gen_versions_list pkg);
+  List.iter (assemble_package p pkg.p_name) pkg.p_versions
 
-let assemble_universe universe_name p =
-  let packages = List.filter is_dir (Util.list_dir p) in
-  write_file (index_page_of_dir p)
-    (gen_universe_page universe_name (List.map fst packages));
-  List.iter
-    (fun (pkg_name, p') -> assemble_package_versions pkg_name p')
-    packages
+let assemble_universe p universe =
+  let p = p / universe.u_name in
+  write_file (index_page_of_dir p) (gen_universe_page universe);
+  List.iter (assemble_package_versions p) universe.u_packages
 
-let assemble_universes p =
-  let universes = List.filter is_dir (Util.list_dir p) in
-  write_file (index_page_of_dir p) (gen_universes_list (List.map fst universes));
-  List.iter (fun (name, p') -> assemble_universe name p') universes
+let assemble_universes p universes =
+  write_file (index_page_of_dir p) (gen_universes_list universes);
+  List.iter (assemble_universe p) universes
 
 let query_comple_deps p =
   let process_line line =
@@ -208,8 +222,8 @@ let compute_compile_deps paths =
     paths deps_and_digests;
   deps_tbl
 
-(** Temporary: Will be done by [prep] when collecting object files.
-    Collect deps for every object files. *)
+(** Temporary: Will be done by [prep] when collecting object files. Collect deps
+    for every object files. *)
 let assemble_dep_file deps dst =
   let print_relpath p =
     (* Make sure the paths are relative to [top_path]. *)
@@ -229,5 +243,6 @@ let assemble_dep_file deps dst =
 
 let run () =
   let deps = list_dir_rec [] top_path |> compute_compile_deps in
-  assemble_universes (top_path / "universes");
+  let universes = read_universes (top_path / "universes") in
+  assemble_universes (top_path / "universes") universes;
   assemble_dep_file deps (top_path / "dep")
