@@ -91,7 +91,7 @@ let gen_package_page pkg_name version subpkgs out =
   List.iter gen_subpkg subpkgs;
   ()
 
-let prep_package pkg_name version p =
+let assemble_package pkg_name version p =
   let subpkgs =
     Util.list_dir (Fpath.( / ) p "lib")
     |> List.filter is_dir
@@ -100,22 +100,22 @@ let prep_package pkg_name version p =
   (* TODO: Detect user's package pages (not yet copied by 'prep') *)
   write_file (index_page_of_dir p) (gen_package_page pkg_name version subpkgs)
 
-let prep_package_versions pkg_name p =
+let assemble_package_versions pkg_name p =
   let versions = List.filter is_dir (Util.list_dir p) in
   write_file (index_page_of_dir p)
     (gen_versions_list pkg_name (List.map fst versions));
-  List.iter (fun (v, p') -> prep_package pkg_name v p') versions
+  List.iter (fun (v, p') -> assemble_package pkg_name v p') versions
 
-let prep_universe universe_name p =
+let assemble_universe universe_name p =
   let packages = List.filter is_dir (Util.list_dir p) in
   write_file (index_page_of_dir p)
     (gen_universe_page universe_name (List.map fst packages));
-  List.iter (fun (pkg_name, p') -> prep_package_versions pkg_name p') packages
+  List.iter (fun (pkg_name, p') -> assemble_package_versions pkg_name p') packages
 
-let prep_universes p =
+let assemble_universes p =
   let universes = List.filter is_dir (Util.list_dir p) in
   write_file (index_page_of_dir p) (gen_universes_list (List.map fst universes));
-  List.iter (fun (name, p') -> prep_universe name p') universes
+  List.iter (fun (name, p') -> assemble_universe name p') universes
 
 let query_comple_deps p =
   let process_line line =
@@ -169,7 +169,7 @@ let compute_compile_deps paths =
 
 (** Temporary: Will be done by [prep] when collecting object files.
     Collect deps for every object files. *)
-let prep_dep_file dst =
+let assemble_dep_file dst =
   let rec list_dir_rec acc p =
     Util.list_dir p
     |> List.fold_left
@@ -195,5 +195,5 @@ let prep_dep_file dst =
                fpf out "\n"))
 
 let run () =
-  prep_universes (Prep.top_path / "universes");
-  prep_dep_file (Prep.top_path / "dep")
+  assemble_universes (Prep.top_path / "universes");
+  assemble_dep_file (Prep.top_path / "dep")
