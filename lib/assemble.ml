@@ -9,6 +9,42 @@ let ( / ) = Fpath.( / )
 
 let fpf = Printf.fprintf
 
+(* TODO: Take this as CLI argument. *)
+let top_path = Prep.top_path
+
+module Deps : sig
+  type t
+  (** Mutable data-structure storing dependencies. *)
+
+  val create : unit -> t
+
+  val add : t -> target:Fpath.t -> Fpath.t list -> unit
+  (** Paths are internally normalized. [target] must be a path to a file, deps
+      can be paths to files or directories. *)
+
+  val fold : (Fpath.t -> Fpath.t list -> 'a -> 'a) -> t -> 'a -> 'a
+end = struct
+  module Tbl = Hashtbl.Make (struct
+    type t = Fpath.t
+
+    let equal = Fpath.equal
+
+    let hash = Hashtbl.hash
+  end)
+
+  type t = Fpath.t list Tbl.t
+
+  let create () = Tbl.create 50
+
+  let add tbl ~target extra_deps =
+    let target = Fpath.normalize target in
+    let deps = match Tbl.find_opt tbl target with Some d -> d | None -> [] in
+    let extra_deps = List.rev_map Fpath.normalize extra_deps in
+    Tbl.replace tbl target (List.rev_append extra_deps deps)
+
+  let fold = Tbl.fold
+end
+
 let write_file p f =
   let out = open_out (Fpath.to_string p) in
   Format.eprintf "Create '%a'\n" Fpath.pp p;
@@ -93,6 +129,8 @@ let gen_package_page pkg_name version subpkgs out =
 
 let assemble_package pkg_name version p =
   let subpkgs =
+    (* This is not working in most cases.
+       TODO: Better listing of sub packages. *)
     Util.list_dir (Fpath.( / ) p "lib")
     |> List.filter is_dir
     |> List.map (fun (s, p') -> (s, modules_of_subpkg p'))
@@ -110,7 +148,9 @@ let assemble_universe universe_name p =
   let packages = List.filter is_dir (Util.list_dir p) in
   write_file (index_page_of_dir p)
     (gen_universe_page universe_name (List.map fst packages));
-  List.iter (fun (pkg_name, p') -> assemble_package_versions pkg_name p') packages
+  List.iter
+    (fun (pkg_name, p') -> assemble_package_versions pkg_name p')
+    packages
 
 let assemble_universes p =
   let universes = List.filter is_dir (Util.list_dir p) in
@@ -126,30 +166,32 @@ let query_comple_deps p =
   Util.lines_of_process "odoc" [ "compile-deps"; Fpath.to_string p ]
   |> List.filter_map process_line
 
+let rec list_dir_rec acc p =
+  Util.list_dir p
+  |> List.fold_left
+       (fun acc ((_, f) as f') ->
+         if is_dir f' then list_dir_rec acc f else f :: acc)
+       acc
+
 module DigestMap = Map.Make (Digest)
 
 let compute_compile_deps paths =
-  let deps_and_digests =
-    (* Query [odoc compile-deps] for every inputs. *)
-    List.map
-      (fun f ->
-        if not (Fpath.mem_ext [ ".cmti"; ".cmt"; ".cmi" ] f) then None
-        else
-          let unit_name =
-            String.capitalize_ascii Fpath.(to_string (rem_ext (base f)))
-          in
-          match
-            List.partition
-              (fun (name, _) -> name = unit_name)
-              (query_comple_deps f)
-          with
-          | [ self ], deps -> Some (snd self, List.map snd deps)
-          | _ ->
-              Format.eprintf "Failed to find digest for self (%a)\n%!" Fpath.pp
-                f;
-              None)
-      paths
+  let deps_and_digest f =
+    (* Query [odoc compile-deps]. *)
+    if not (Fpath.mem_ext [ ".cmti"; ".cmt"; ".cmi" ] f) then None
+    else
+      let unit_name =
+        String.capitalize_ascii Fpath.(to_string (rem_ext (base f)))
+      in
+      match
+        List.partition (fun (name, _) -> name = unit_name) (query_comple_deps f)
+      with
+      | [ self ], deps -> Some (snd self, List.map snd deps)
+      | _ ->
+          Format.eprintf "Failed to find digest for self (%a)\n%!" Fpath.pp f;
+          None
   in
+  let deps_and_digests = List.rev_map deps_and_digest paths in
   let inputs_by_digest =
     List.fold_left2
       (fun acc f -> function Some (digest, _) -> DigestMap.add digest f acc
@@ -157,43 +199,35 @@ let compute_compile_deps paths =
       DigestMap.empty paths deps_and_digests
   in
   let find_dep dep = DigestMap.find_opt dep inputs_by_digest in
-  List.fold_left2
-    (fun acc f d ->
-      let deps =
-        match d with
-        | Some (_, deps) -> List.filter_map find_dep deps
-        | None -> []
-      in
-      (f, deps) :: acc)
-    [] paths deps_and_digests
+  let deps_tbl = Deps.create () in
+  List.iter2
+    (fun target -> function
+      | Some (_, deps) ->
+          Deps.add deps_tbl ~target (List.filter_map find_dep deps)
+      | None -> ())
+    paths deps_and_digests;
+  deps_tbl
 
 (** Temporary: Will be done by [prep] when collecting object files.
     Collect deps for every object files. *)
-let assemble_dep_file dst =
-  let rec list_dir_rec acc p =
-    Util.list_dir p
-    |> List.fold_left
-         (fun acc ((_, f) as f') ->
-           if is_dir f' then list_dir_rec acc f else f :: acc)
-         acc
-  in
-  let relpath p =
-    match Fpath.relativize ~root:Prep.top_path p with
-    | Some r -> r
+let assemble_dep_file deps dst =
+  let print_relpath p =
+    (* Make sure the paths are relative to [top_path]. *)
+    match Fpath.relativize ~root:top_path p with
+    | Some r -> Fpath.to_string r
     | None -> assert false
   in
   write_file dst (fun out ->
-      list_dir_rec [] Prep.top_path
-      |> compute_compile_deps
-      |> List.iter (function
-           | _, [] -> ()
-           | hd, tl ->
-               fpf out "%s" (Fpath.to_string (relpath hd));
-               List.iter
-                 (fun p -> fpf out " %s" (Fpath.to_string (relpath p)))
-                 tl;
-               fpf out "\n"))
+      Deps.fold
+        (fun target deps () ->
+          if deps = [] then ()
+          else (
+            fpf out "%s" (print_relpath target);
+            List.iter (fun p -> fpf out " %s" (print_relpath p)) deps;
+            fpf out "\n" ))
+        deps ())
 
 let run () =
-  assemble_universes (Prep.top_path / "universes");
-  assemble_dep_file (Prep.top_path / "dep")
+  let deps = list_dir_rec [] top_path |> compute_compile_deps in
+  assemble_universes (top_path / "universes");
+  assemble_dep_file deps (top_path / "dep")
